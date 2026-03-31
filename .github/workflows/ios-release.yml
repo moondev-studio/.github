@@ -1,6 +1,6 @@
 # ios-release.yml — Reusable iOS release workflow
 # Fetches signing credentials from MoonDeveloper Vault.
-# Uses self-hosted runner (moon-m4) to avoid 10x GitHub-hosted macOS billing.
+# Uses GitHub-hosted macos-15-xlarge runner.
 #
 # Required org secrets: VAULT_BUILD_TOKEN, SYNC_PAT
 # Optional per-repo secrets: GOOGLE_SERVICES_JSON_BASE64, GOOGLE_SERVICE_INFO_PLIST_BASE64, GEMINI_API_KEY
@@ -50,7 +50,7 @@ env:
 jobs:
   ios-release:
     name: Build & Release iOS (${{ inputs.app_name }})
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: macos-15-xlarge
     timeout-minutes: 90
 
     steps:
