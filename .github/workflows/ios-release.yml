@@ -1,0 +1,320 @@
+# ios-release.yml — Reusable iOS release workflow
+# Fetches signing credentials from MoonDeveloper Vault.
+# Uses self-hosted runner (moon-m4) to avoid 10x GitHub-hosted macOS billing.
+#
+# Required org secrets: VAULT_BUILD_TOKEN, SYNC_PAT
+# Optional per-repo secrets: GOOGLE_SERVICES_JSON_BASE64, GOOGLE_SERVICE_INFO_PLIST_BASE64, GEMINI_API_KEY
+
+name: iOS Release (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: 'App identifier (splitly|habitflow|couplesync|focuson)'
+        type: string
+        required: true
+      bundle_id:
+        description: 'iOS bundle identifier'
+        type: string
+        required: true
+      scheme:
+        description: 'Xcode scheme name'
+        type: string
+        required: true
+      xcworkspace:
+        description: 'Path to .xcworkspace from repo root'
+        type: string
+        required: true
+      dry_run:
+        description: 'true = archive + artifact only; false = also upload to TestFlight'
+        type: boolean
+        default: true
+    secrets:
+      VAULT_BUILD_TOKEN:
+        required: true
+      SYNC_PAT:
+        required: true
+      GOOGLE_SERVICES_JSON_BASE64:
+        required: false
+      GOOGLE_SERVICE_INFO_PLIST_BASE64:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+
+env:
+  VAULT_BASE_URL: https://moon-server-production.up.railway.app
+  TEAM_ID: 667PKR9RY6
+  JAVA_VERSION: '17'
+
+jobs:
+  ios-release:
+    name: Build & Release iOS (${{ inputs.app_name }})
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout app
+        uses: actions/checkout@v4
+
+      - name: Checkout moon-kmp-libs
+        uses: actions/checkout@v4
+        with:
+          repository: moondev-studio/moon-kmp-libs
+          path: moon-kmp-libs-repo
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Checkout moon-app-libs
+        uses: actions/checkout@v4
+        with:
+          repository: moondev-studio/moon-app-libs
+          path: moon-app-libs-repo
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Place sibling repos
+        run: |
+          PARENT="$(dirname $GITHUB_WORKSPACE)"
+          rm -rf "$PARENT/moon-kmp-libs" "$PARENT/moon-app-libs" 2>/dev/null || true
+          mv "$GITHUB_WORKSPACE/moon-kmp-libs-repo" "$PARENT/moon-kmp-libs"
+          mv "$GITHUB_WORKSPACE/moon-app-libs-repo" "$PARENT/moon-app-libs"
+
+      - name: Patch includeBuild build-logic conflicts
+        run: |
+          PARENT="$(dirname $GITHUB_WORKSPACE)"
+          KMP="$PARENT/moon-kmp-libs"
+          if [ -d "$KMP/build-logic" ]; then mv "$KMP/build-logic" "$KMP/moon-build-logic"; fi
+          if [ -f "$KMP/settings.gradle.kts" ]; then
+            sed -i '' 's|includeBuild("build-logic")|includeBuild("moon-build-logic")|g' "$KMP/settings.gradle.kts"
+          fi
+          APP="$PARENT/moon-app-libs"
+          if [ -d "$APP/build-logic" ]; then mv "$APP/build-logic" "$APP/app-build-logic"; fi
+          if [ -f "$APP/settings.gradle.kts" ]; then
+            sed -i '' 's|includeBuild("build-logic")|includeBuild("app-build-logic")|g' "$APP/settings.gradle.kts"
+          fi
+          rm -rf "$GITHUB_WORKSPACE/.gradle/configuration-cache" || true
+
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-ios-${{ hashFiles('**/*.gradle*', '**/libs.versions.toml') }}
+          restore-keys: ${{ runner.os }}-gradle-ios-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Create local.properties
+        run: |
+          PARENT="$(dirname $GITHUB_WORKSPACE)"
+          SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+          echo "sdk.dir=$SDK" > local.properties
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> local.properties
+          fi
+          echo "sdk.dir=$SDK" > "$PARENT/moon-kmp-libs/local.properties"
+          echo "sdk.dir=$SDK" > "$PARENT/moon-app-libs/local.properties"
+
+      - name: Decode google-services.json
+        if: "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 != '' }}"
+        run: echo "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}" | base64 -d > composeApp/google-services.json
+
+      - name: Decode GoogleService-Info.plist
+        if: "${{ secrets.GOOGLE_SERVICE_INFO_PLIST_BASE64 != '' }}"
+        run: echo "${{ secrets.GOOGLE_SERVICE_INFO_PLIST_BASE64 }}" | base64 -d > iosApp/iosApp/GoogleService-Info.plist
+
+      - name: Install CocoaPods dependencies
+        run: |
+          if [ -f "iosApp/Podfile" ]; then
+            cd iosApp && pod install --repo-update
+          fi
+
+      - name: Fetch iOS credentials from Vault
+        env:
+          VAULT_TOKEN: ${{ secrets.VAULT_BUILD_TOKEN }}
+        run: |
+          fetch() {
+            local key=$1
+            curl -sf \
+              -H "Authorization: Bearer ${VAULT_TOKEN}" \
+              "${VAULT_BASE_URL}/api/vault/credential?key=${key}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])"
+          }
+
+          # Global iOS credentials
+          P12_B64=$(fetch "global.ios.distribution.p12")
+          P12_PASSWORD=$(fetch "global.ios.distribution.p12.password")
+          ASC_KEY_B64=$(fetch "global.asc.api.key.p8")
+          ASC_KEY_ID=$(fetch "global.asc.api.key.id")
+          ASC_ISSUER_ID=$(fetch "global.asc.api.key.issuer")
+
+          # Write p12
+          echo "${P12_B64}" | base64 --decode > /tmp/cert.p12
+
+          # Write ASC p8 key file
+          mkdir -p ~/private_keys
+          echo "${ASC_KEY_B64}" | base64 --decode > ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          chmod 600 ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+
+          # Export to env
+          echo "IOS_P12_PASSWORD=${P12_PASSWORD}" >> $GITHUB_ENV
+          echo "ASC_KEY_ID=${ASC_KEY_ID}" >> $GITHUB_ENV
+          echo "ASC_ISSUER_ID=${ASC_ISSUER_ID}" >> $GITHUB_ENV
+
+      - name: Import certificate to keychain
+        run: |
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+          KEYCHAIN_PATH=$RUNNER_TEMP/${{ inputs.app_name }}_ci.keychain
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import /tmp/cert.p12 -P "${IOS_P12_PASSWORD}" -A \
+            -t cert -f pkcs12 -k "${KEYCHAIN_PATH}"
+          security list-keychain -d user -s "${KEYCHAIN_PATH}"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}" >> $GITHUB_ENV
+          echo "KEYCHAIN_PASSWORD=${KEYCHAIN_PASSWORD}" >> $GITHUB_ENV
+
+      # -------------------------------------------------------
+      # KMP Framework: Compile -> free memory -> Link
+      # Split to avoid OOM on M4 (16GB) or GitHub runner (14GB)
+      # -------------------------------------------------------
+      - name: Compile Kotlin/Native
+        env:
+          GRADLE_OPTS: "-Xmx4g -Xms1g -XX:+UseG1GC -Dfile.encoding=UTF-8"
+        run: |
+          ./gradlew :composeApp:compileKotlinIosArm64 \
+            --no-daemon --max-workers 2 --no-configuration-cache
+
+      - name: Free memory for linker
+        run: |
+          ./gradlew --stop || true
+          pkill -9 -f "kotlin-daemon" || true
+          pkill -9 -f "kotlin.daemon" || true
+          pkill -9 -f "org.gradle" || true
+          rm -rf ~/Library/Developer/Xcode/DerivedData/* 2>/dev/null || true
+          sleep 10
+
+      - name: Link KMP Framework
+        env:
+          GRADLE_OPTS: "-Xmx12g -Xms2g -XX:+UseSerialGC -Dfile.encoding=UTF-8"
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          echo "kotlin.native.jvmArgs=-Xmx12g -XX:+UseSerialGC" >> gradle.properties
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "=== DRY RUN: Building debug framework (saves ~5g) ==="
+            TASK=":composeApp:linkDebugFrameworkIosArm64"
+          else
+            echo "=== RELEASE: Building release framework ==="
+            TASK=":composeApp:linkReleaseFrameworkIosArm64"
+          fi
+
+          ./gradlew $TASK \
+            --no-daemon --max-workers 1 --no-configuration-cache \
+            -Pkotlin.native.compilation.workers=1
+
+      - name: Prepare framework for Xcode (dry_run)
+        if: inputs.dry_run == true
+        run: |
+          DEBUG_FW="composeApp/build/bin/iosArm64/debugFramework/ComposeApp.framework"
+          RELEASE_DIR="composeApp/build/bin/iosArm64/releaseFramework"
+          if [ -d "$DEBUG_FW" ]; then
+            mkdir -p "$RELEASE_DIR"
+            cp -R "$DEBUG_FW" "$RELEASE_DIR/ComposeApp.framework"
+            echo "Debug framework copied to release path for Xcode CI build"
+          fi
+
+      - name: Stop all daemons (free memory for Xcode)
+        run: |
+          ./gradlew --stop || true
+          pkill -f "kotlin-daemon" || true
+          sleep 10
+
+      - name: Xcode Archive
+        run: |
+          ARCHIVE_PATH=$RUNNER_TEMP/${{ inputs.app_name }}.xcarchive
+          echo "ARCHIVE_PATH=${ARCHIVE_PATH}" >> $GITHUB_ENV
+
+          gem install xcpretty 2>/dev/null || true
+
+          xcodebuild archive \
+            -workspace ${{ inputs.xcworkspace }} \
+            -scheme ${{ inputs.scheme }} \
+            -configuration Release \
+            -archivePath "${ARCHIVE_PATH}" \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM=${{ env.TEAM_ID }} \
+            | xcpretty || true
+
+          # Verify archive exists
+          ls -la "${ARCHIVE_PATH}/Products/" || { echo "::error::Archive failed"; exit 1; }
+
+      - name: Export IPA
+        run: |
+          IPA_DIR=$RUNNER_TEMP/ipa
+          EXPORT_OPTIONS=$RUNNER_TEMP/ExportOptions.plist
+
+          cat > "${EXPORT_OPTIONS}" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store</string>
+            <key>teamID</key>
+            <string>667PKR9RY6</string>
+            <key>uploadBitcode</key>
+            <false/>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          xcodebuild -exportArchive \
+            -archivePath "${ARCHIVE_PATH}" \
+            -exportOptionsPlist "${EXPORT_OPTIONS}" \
+            -exportPath "${IPA_DIR}" \
+            | xcpretty || true
+
+          IPA_PATH=$(find "${IPA_DIR}" -name "*.ipa" | head -1)
+          echo "IPA_PATH=${IPA_PATH}" >> $GITHUB_ENV
+          echo "Found IPA: ${IPA_PATH}"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-release-ipa-${{ github.run_number }}
+          path: ${{ env.IPA_PATH }}
+          retention-days: 7
+
+      - name: Upload to TestFlight
+        if: inputs.dry_run == false
+        run: |
+          xcrun altool --upload-app \
+            -f "${IPA_PATH}" \
+            --type ios \
+            --apiKey "${ASC_KEY_ID}" \
+            --apiIssuer "${ASC_ISSUER_ID}" \
+            --show-progress
+
+      - name: Cleanup sensitive files
+        if: always()
+        run: |
+          rm -f /tmp/cert.p12
+          rm -rf ~/private_keys
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then
+            security delete-keychain "${KEYCHAIN_PATH}" 2>/dev/null || true
+          fi

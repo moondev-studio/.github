@@ -1,0 +1,208 @@
+# android-release.yml — Reusable Android release workflow
+# Fetches signing credentials from MoonDeveloper Vault, builds AAB,
+# optionally uploads to Play Console.
+#
+# Required org secrets: VAULT_BUILD_TOKEN, SYNC_PAT
+# Optional per-repo secrets: GOOGLE_SERVICES_JSON_BASE64, GEMINI_API_KEY,
+#                             PLAY_STORE_SERVICE_ACCOUNT_JSON
+
+name: Android Release (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: 'App identifier (splitly|habitflow|couplesync|focuson)'
+        type: string
+        required: true
+      package_name:
+        description: 'Android package name'
+        type: string
+        required: true
+      keystore_filename:
+        description: 'Keystore filename to write (e.g., splitly-upload-key.jks)'
+        type: string
+        default: 'release.jks'
+      dry_run:
+        description: 'true = build + artifact only; false = also upload to Play Console'
+        type: boolean
+        default: true
+    secrets:
+      VAULT_BUILD_TOKEN:
+        required: true
+      SYNC_PAT:
+        required: true
+      GOOGLE_SERVICES_JSON_BASE64:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      PLAY_STORE_SERVICE_ACCOUNT_JSON:
+        required: false
+
+env:
+  VAULT_BASE_URL: https://moon-server-production.up.railway.app
+  JAVA_VERSION: '17'
+
+jobs:
+  android-release:
+    name: Build & Release Android (${{ inputs.app_name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout app
+        uses: actions/checkout@v4
+
+      - name: Checkout moon-kmp-libs
+        uses: actions/checkout@v4
+        with:
+          repository: moondev-studio/moon-kmp-libs
+          path: moon-kmp-libs-repo
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Checkout moon-app-libs
+        uses: actions/checkout@v4
+        with:
+          repository: moondev-studio/moon-app-libs
+          path: moon-app-libs-repo
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Place sibling repos
+        run: |
+          PARENT="$(dirname $GITHUB_WORKSPACE)"
+          rm -rf "$PARENT/moon-kmp-libs" "$PARENT/moon-app-libs" 2>/dev/null || true
+          mv "$GITHUB_WORKSPACE/moon-kmp-libs-repo" "$PARENT/moon-kmp-libs"
+          mv "$GITHUB_WORKSPACE/moon-app-libs-repo" "$PARENT/moon-app-libs"
+
+      - name: Patch includeBuild build-logic conflicts
+        run: |
+          PARENT="$(dirname $GITHUB_WORKSPACE)"
+          KMP="$PARENT/moon-kmp-libs"
+          if [ -d "$KMP/build-logic" ]; then mv "$KMP/build-logic" "$KMP/moon-build-logic"; fi
+          if [ -f "$KMP/settings.gradle.kts" ]; then
+            sed -i 's|includeBuild("build-logic")|includeBuild("moon-build-logic")|g' "$KMP/settings.gradle.kts"
+          fi
+          APP="$PARENT/moon-app-libs"
+          if [ -d "$APP/build-logic" ]; then mv "$APP/build-logic" "$APP/app-build-logic"; fi
+          if [ -f "$APP/settings.gradle.kts" ]; then
+            sed -i 's|includeBuild("build-logic")|includeBuild("app-build-logic")|g' "$APP/settings.gradle.kts"
+          fi
+          rm -rf "$GITHUB_WORKSPACE/.gradle/configuration-cache" || true
+
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-android-${{ hashFiles('**/*.gradle*', '**/libs.versions.toml') }}
+          restore-keys: ${{ runner.os }}-gradle-android-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Create local.properties
+        run: |
+          PARENT="$(dirname $GITHUB_WORKSPACE)"
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> local.properties
+          fi
+          echo "sdk.dir=$ANDROID_HOME" > "$PARENT/moon-kmp-libs/local.properties"
+          echo "sdk.dir=$ANDROID_HOME" > "$PARENT/moon-app-libs/local.properties"
+
+      - name: Decode google-services.json
+        if: "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 != '' }}"
+        run: echo "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}" | base64 -d > composeApp/google-services.json
+
+      - name: Fetch keystore credentials from Vault
+        env:
+          VAULT_TOKEN: ${{ secrets.VAULT_BUILD_TOKEN }}
+          APP: ${{ inputs.app_name }}
+        run: |
+          fetch() {
+            local key=$1
+            curl -sf \
+              -H "Authorization: Bearer ${VAULT_TOKEN}" \
+              "${VAULT_BASE_URL}/api/vault/credential?key=${key}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])"
+          }
+
+          KEYSTORE_B64=$(fetch "${APP}.android.keystore")
+          STORE_PASSWORD=$(fetch "${APP}.android.keystore.store_password")
+          KEY_ALIAS=$(fetch "${APP}.android.keystore.alias")
+          KEY_PASSWORD=$(fetch "${APP}.android.keystore.key_password")
+
+          # Decode and write keystore
+          echo "${KEYSTORE_B64}" | base64 --decode > "${{ inputs.keystore_filename }}"
+
+          # Write secrets.properties (standard format for MoonDeveloper apps)
+          cat > secrets.properties << EOF
+          RELEASE_STORE_FILE=${{ inputs.keystore_filename }}
+          RELEASE_STORE_PASSWORD=${STORE_PASSWORD}
+          RELEASE_KEY_ALIAS=${KEY_ALIAS}
+          RELEASE_KEY_PASSWORD=${KEY_PASSWORD}
+          EOF
+
+      # Split Android build: compile -> kill daemons -> R8/bundle
+      # ubuntu-latest (7GB) can't run Kotlin daemon (5g) + R8 (4g) simultaneously
+      - name: Compile Release Kotlin
+        env:
+          GRADLE_OPTS: "-Xmx4g -Dfile.encoding=UTF-8"
+        run: |
+          ./gradlew :composeApp:compileReleaseKotlinAndroid \
+            :composeApp:compileReleaseJavaWithJavac \
+            --no-daemon --no-configuration-cache -q
+
+      - name: Stop Kotlin daemons (free memory for R8)
+        run: |
+          pkill -f "kotlin-daemon" || true
+          pkill -f "kotlin.daemon" || true
+          ./gradlew --stop || true
+          sleep 5
+
+      - name: Bundle Release AAB (R8 minification)
+        env:
+          GRADLE_OPTS: "-Xmx5g -Dfile.encoding=UTF-8"
+        run: |
+          ./gradlew :composeApp:bundleRelease \
+            -x lintVitalAnalyzeRelease -x lintVitalReportRelease -x lintVitalRelease \
+            --no-daemon --no-configuration-cache --stacktrace
+
+      - name: Verify AAB exists
+        run: |
+          AAB_PATH="composeApp/build/outputs/bundle/release/composeApp-release.aab"
+          if [ ! -f "$AAB_PATH" ]; then
+            echo "::error::AAB not found at $AAB_PATH"
+            ls -la composeApp/build/outputs/bundle/release/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "AAB found: $(ls -lh $AAB_PATH)"
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-release-aab-${{ github.run_number }}
+          path: composeApp/build/outputs/bundle/release/*.aab
+          retention-days: 7
+
+      - name: Upload to Play Console
+        if: inputs.dry_run == false && secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON != ''
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.package_name }}
+          releaseFiles: composeApp/build/outputs/bundle/release/*.aab
+          track: internal
+          status: completed
+
+      - name: Cleanup sensitive files
+        if: always()
+        run: |
+          rm -f "${{ inputs.keystore_filename }}" secrets.properties
