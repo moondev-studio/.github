@@ -41,6 +41,8 @@ on:
         required: false
       GEMINI_API_KEY:
         required: false
+      IOS_P12_BASE64:
+        required: false
 
 env:
   VAULT_BASE_URL: https://moon-server-production.up.railway.app
@@ -144,9 +146,10 @@ jobs:
             cd iosApp && pod install --repo-update
           fi
 
-      - name: Fetch iOS credentials from Vault
+      - name: Fetch iOS credentials (Vault with GitHub Secret fallback)
         env:
           VAULT_TOKEN: ${{ secrets.VAULT_BUILD_TOKEN }}
+          P12_GITHUB_SECRET: ${{ secrets.IOS_P12_BASE64 }}
         run: |
           fetch() {
             local key=$1
@@ -156,8 +159,14 @@ jobs:
               | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])"
           }
 
-          # Global iOS credentials
-          P12_B64=$(fetch "global.ios.distribution.p12")
+          # p12: Vault first, GitHub Secret fallback (Vault 48KB limit workaround)
+          P12_B64=$(fetch "global.ios.distribution.p12" 2>/dev/null) || P12_B64="${P12_GITHUB_SECRET}"
+          if [ -z "$P12_B64" ]; then
+            echo "::error::p12 fetch failed (Vault + GitHub Secret both empty)"
+            exit 1
+          fi
+
+          # Other credentials from Vault
           P12_PASSWORD=$(fetch "global.ios.distribution.p12.password")
           ASC_KEY_B64=$(fetch "global.asc.api.key.p8")
           ASC_KEY_ID=$(fetch "global.asc.api.key.id")
