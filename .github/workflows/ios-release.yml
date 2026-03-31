@@ -266,18 +266,12 @@ jobs:
           pkill -f "kotlin-daemon" || true
           sleep 10
 
-      - name: Diagnose Xcode setup
-        run: |
-          echo "=== Schemes ==="
-          xcodebuild -list -workspace ${{ inputs.xcworkspace }} 2>&1 || true
-          echo "=== Pre-built framework check ==="
-          ls -la composeApp/build/bin/iosArm64/releaseFramework/ComposeApp.framework/ 2>&1 || echo "No release framework"
-          ls -la composeApp/build/bin/iosArm64/debugFramework/ComposeApp.framework/ 2>&1 || echo "No debug framework"
-
       - name: Xcode Archive
         run: |
           ARCHIVE_PATH=$RUNNER_TEMP/${{ inputs.app_name }}.xcarchive
           echo "ARCHIVE_PATH=${ARCHIVE_PATH}" >> $GITHUB_ENV
+
+          gem install xcpretty 2>/dev/null || true
 
           xcodebuild archive \
             -workspace ${{ inputs.xcworkspace }} \
@@ -285,12 +279,22 @@ jobs:
             -configuration Release \
             -archivePath "${ARCHIVE_PATH}" \
             -destination "generic/platform=iOS" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${ASC_KEY_ID}.p8 \
+            -authenticationKeyID "${ASC_KEY_ID}" \
+            -authenticationKeyIssuerID "${ASC_ISSUER_ID}" \
             CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM=${{ env.TEAM_ID }} \
-            2>&1 | tail -200
+            2>&1 | tee /tmp/xcodebuild.log | xcpretty || true
 
-          # Verify archive exists
-          ls -la "${ARCHIVE_PATH}/Products/" || { echo "::error::Archive failed"; exit 1; }
+          # Verify archive exists, show raw log on failure
+          ls -la "${ARCHIVE_PATH}/Products/" || {
+            echo "::group::Xcode raw log (last 100 lines)"
+            tail -100 /tmp/xcodebuild.log
+            echo "::endgroup::"
+            echo "::error::Archive failed"
+            exit 1
+          }
 
       - name: Export IPA
         run: |
