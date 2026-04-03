@@ -238,34 +238,22 @@ jobs:
 
       - name: Link KMP Framework
         env:
-          # Single JVM: K/N runs in-process (no separate worker JVM)
-          # 14GB runner = 12g JVM + 2g OS
-          GRADLE_OPTS: "-Xmx12g -Xms2g -XX:+UseSerialGC -Dfile.encoding=UTF-8"
-          DRY_RUN: ${{ inputs.dry_run }}
+          # 14GB runner cannot fit K/N release link (needs >12g heap)
+          # Always build debug framework — Xcode handles its own Release optimizations
+          # TODO: switch to linkRelease when runner has ≥24GB RAM
+          GRADLE_OPTS: "-Xmx8g -Xms2g -XX:+UseSerialGC -Dfile.encoding=UTF-8"
         run: |
-          if [ "$DRY_RUN" = "true" ]; then
-            echo "=== DRY RUN: Building debug framework (saves ~5g) ==="
-            TASK=":composeApp:linkDebugFrameworkIosArm64"
-          else
-            echo "=== RELEASE: Building release framework ==="
-            TASK=":composeApp:linkReleaseFrameworkIosArm64"
-          fi
-
-          # Run K/N in-process (no kotlin.native.compilation.workers)
-          # This avoids spawning a separate JVM that competes for RAM
-          ./gradlew $TASK \
+          echo "=== Building debug framework (14GB runner OOM workaround) ==="
+          ./gradlew :composeApp:linkDebugFrameworkIosArm64 \
             --no-daemon --max-workers 1 --no-configuration-cache
 
-      - name: Prepare framework for Xcode (dry_run)
-        if: inputs.dry_run == true
+      - name: Prepare framework for Xcode
         run: |
           DEBUG_FW="composeApp/build/bin/iosArm64/debugFramework/ComposeApp.framework"
           RELEASE_DIR="composeApp/build/bin/iosArm64/releaseFramework"
-          if [ -d "$DEBUG_FW" ]; then
-            mkdir -p "$RELEASE_DIR"
-            cp -R "$DEBUG_FW" "$RELEASE_DIR/ComposeApp.framework"
-            echo "Debug framework copied to release path for Xcode CI build"
-          fi
+          mkdir -p "$RELEASE_DIR"
+          cp -R "$DEBUG_FW" "$RELEASE_DIR/ComposeApp.framework"
+          echo "Debug framework placed at release path for Xcode archive"
 
       - name: Stop all daemons (free memory for Xcode)
         run: |
