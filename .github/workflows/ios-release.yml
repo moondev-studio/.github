@@ -238,12 +238,11 @@ jobs:
 
       - name: Link KMP Framework
         env:
-          GRADLE_OPTS: "-Xmx2g -Xms512m -XX:+UseSerialGC -Dfile.encoding=UTF-8"
+          # Single JVM: K/N runs in-process (no separate worker JVM)
+          # 14GB runner = 12g JVM + 2g OS
+          GRADLE_OPTS: "-Xmx12g -Xms2g -XX:+UseSerialGC -Dfile.encoding=UTF-8"
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # Runner has 14GB — Gradle orchestrator 2g + K/N linker 10g = 12g (2g for OS)
-          echo "kotlin.native.jvmArgs=-Xmx10g -XX:+UseSerialGC" >> gradle.properties
-
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN: Building debug framework (saves ~5g) ==="
             TASK=":composeApp:linkDebugFrameworkIosArm64"
@@ -252,18 +251,10 @@ jobs:
             TASK=":composeApp:linkReleaseFrameworkIosArm64"
           fi
 
-          # Attempt with retry (K/N linker OOM is sometimes transient)
+          # Run K/N in-process (no kotlin.native.compilation.workers)
+          # This avoids spawning a separate JVM that competes for RAM
           ./gradlew $TASK \
-            --no-daemon --max-workers 1 --no-configuration-cache \
-            -Pkotlin.native.compilation.workers=1 \
-          || {
-            echo "::warning::Link failed, retrying after memory cleanup..."
-            pkill -9 -f "java" || true
-            sleep 20
-            ./gradlew $TASK \
-              --no-daemon --max-workers 1 --no-configuration-cache \
-              -Pkotlin.native.compilation.workers=1
-          }
+            --no-daemon --max-workers 1 --no-configuration-cache
 
       - name: Prepare framework for Xcode (dry_run)
         if: inputs.dry_run == true
