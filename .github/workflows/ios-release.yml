@@ -43,6 +43,8 @@ on:
         required: false
       IOS_P12_BASE64:
         required: false
+      IOS_PROVISIONING_PROFILE:
+        required: false
 
 env:
   VAULT_BASE_URL: https://moon-server-production.up.railway.app
@@ -210,6 +212,25 @@ jobs:
           echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}" >> $GITHUB_ENV
           echo "KEYCHAIN_PASSWORD=${KEYCHAIN_PASSWORD}" >> $GITHUB_ENV
 
+      - name: Install provisioning profile
+        env:
+          PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          if [ -n "$PROVISIONING_PROFILE" ]; then
+            PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+            mkdir -p "$PROFILE_DIR"
+            echo "$PROVISIONING_PROFILE" | base64 --decode > /tmp/profile.mobileprovision
+            # Extract UUID from profile
+            PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< \
+              $(security cms -D -i /tmp/profile.mobileprovision))
+            cp /tmp/profile.mobileprovision "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
+            echo "Installed provisioning profile: $PROFILE_UUID"
+            echo "PROFILE_UUID=${PROFILE_UUID}" >> $GITHUB_ENV
+            rm -f /tmp/profile.mobileprovision
+          else
+            echo "::warning::No provisioning profile secret — relying on cloud signing"
+          fi
+
       # -------------------------------------------------------
       # KMP Framework: Compile -> free memory -> Link
       # Split to avoid OOM on M4 (16GB) or GitHub runner (14GB)
@@ -296,11 +317,38 @@ jobs:
           IPA_DIR=$RUNNER_TEMP/ipa
           EXPORT_OPTIONS=$RUNNER_TEMP/ExportOptions.plist
 
-          # List downloaded provisioning profiles for debugging
-          echo "=== Downloaded provisioning profiles ==="
+          echo "=== Provisioning profiles ==="
           ls -la ~/Library/MobileDevice/Provisioning\ Profiles/ 2>/dev/null || echo "No profiles directory"
 
-          cat > "${EXPORT_OPTIONS}" << 'PLIST'
+          # Build ExportOptions.plist — use manual signing if profile installed
+          if [ -n "${PROFILE_UUID:-}" ]; then
+            echo "Using manual signing with profile $PROFILE_UUID"
+            cat > "${EXPORT_OPTIONS}" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store</string>
+            <key>teamID</key>
+            <string>667PKR9RY6</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${{ inputs.bundle_id }}</key>
+              <string>${PROFILE_UUID}</string>
+            </dict>
+            <key>uploadBitcode</key>
+            <false/>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          else
+            echo "No local profile — using cloud signing"
+            cat > "${EXPORT_OPTIONS}" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -316,6 +364,7 @@ jobs:
           </dict>
           </plist>
           PLIST
+          fi
 
           xcodebuild -exportArchive \
             -archivePath "${ARCHIVE_PATH}" \
@@ -325,7 +374,14 @@ jobs:
             -authenticationKeyPath ~/private_keys/AuthKey_${ASC_KEY_ID}.p8 \
             -authenticationKeyID "${ASC_KEY_ID}" \
             -authenticationKeyIssuerID "${ASC_ISSUER_ID}" \
-            | xcpretty || true
+            2>&1 | tee /tmp/export.log | xcpretty || true
+
+          # Show raw export log on failure
+          if [ ! -d "${IPA_DIR}" ]; then
+            echo "::group::Export raw log"
+            cat /tmp/export.log
+            echo "::endgroup::"
+          fi
 
           IPA_PATH=$(find "${IPA_DIR}" -name "*.ipa" 2>/dev/null | head -1)
           if [ -z "$IPA_PATH" ]; then
