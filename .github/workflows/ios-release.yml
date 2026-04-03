@@ -307,9 +307,11 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>method</key>
-            <string>app-store</string>
+            <string>app-store-connect</string>
             <key>teamID</key>
             <string>667PKR9RY6</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
             <key>uploadBitcode</key>
             <false/>
             <key>uploadSymbols</key>
@@ -322,9 +324,18 @@ jobs:
             -archivePath "${ARCHIVE_PATH}" \
             -exportOptionsPlist "${EXPORT_OPTIONS}" \
             -exportPath "${IPA_DIR}" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${ASC_KEY_ID}.p8 \
+            -authenticationKeyID "${ASC_KEY_ID}" \
+            -authenticationKeyIssuerID "${ASC_ISSUER_ID}" \
             | xcpretty || true
 
-          IPA_PATH=$(find "${IPA_DIR}" -name "*.ipa" | head -1)
+          IPA_PATH=$(find "${IPA_DIR}" -name "*.ipa" 2>/dev/null | head -1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::IPA not found — exportArchive failed"
+            ls -la "${IPA_DIR}" 2>/dev/null || echo "IPA directory not created"
+            exit 1
+          fi
           echo "IPA_PATH=${IPA_PATH}" >> $GITHUB_ENV
           echo "Found IPA: ${IPA_PATH}"
 
