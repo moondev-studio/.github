@@ -238,10 +238,11 @@ jobs:
 
       - name: Link KMP Framework
         env:
-          GRADLE_OPTS: "-Xmx4g -Xms1g -XX:+UseSerialGC -Dfile.encoding=UTF-8"
+          GRADLE_OPTS: "-Xmx2g -Xms512m -XX:+UseSerialGC -Dfile.encoding=UTF-8"
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          echo "kotlin.native.jvmArgs=-Xmx12g -XX:+UseSerialGC" >> gradle.properties
+          # Runner has 14GB — Gradle orchestrator 2g + K/N linker 10g = 12g (2g for OS)
+          echo "kotlin.native.jvmArgs=-Xmx10g -XX:+UseSerialGC" >> gradle.properties
 
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN: Building debug framework (saves ~5g) ==="
