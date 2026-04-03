@@ -317,17 +317,19 @@ jobs:
           IPA_DIR=$RUNNER_TEMP/ipa
           EXPORT_OPTIONS=$RUNNER_TEMP/ExportOptions.plist
 
+          # List downloaded provisioning profiles for debugging
+          echo "=== Downloaded provisioning profiles ==="
+          ls -la ~/Library/MobileDevice/Provisioning\ Profiles/ 2>/dev/null || echo "No profiles directory"
+
           cat > "${EXPORT_OPTIONS}" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
             <key>method</key>
-            <string>app-store-connect</string>
+            <string>app-store</string>
             <key>teamID</key>
             <string>667PKR9RY6</string>
-            <key>signingStyle</key>
-            <string>automatic</string>
             <key>uploadBitcode</key>
             <false/>
             <key>uploadSymbols</key>
