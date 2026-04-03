@@ -227,12 +227,18 @@ jobs:
           pkill -9 -f "kotlin-daemon" || true
           pkill -9 -f "kotlin.daemon" || true
           pkill -9 -f "org.gradle" || true
+          pkill -9 -f "java" || true
           rm -rf ~/Library/Developer/Xcode/DerivedData/* 2>/dev/null || true
-          sleep 10
+          rm -rf ~/.gradle/daemon 2>/dev/null || true
+          # Log available memory
+          echo "=== Memory before link ==="
+          vm_stat | head -10
+          sysctl hw.memsize | awk '{print "Total RAM: " $2/1024/1024/1024 " GB"}'
+          sleep 15
 
       - name: Link KMP Framework
         env:
-          GRADLE_OPTS: "-Xmx12g -Xms2g -XX:+UseSerialGC -Dfile.encoding=UTF-8"
+          GRADLE_OPTS: "-Xmx4g -Xms1g -XX:+UseSerialGC -Dfile.encoding=UTF-8"
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           echo "kotlin.native.jvmArgs=-Xmx12g -XX:+UseSerialGC" >> gradle.properties
@@ -245,9 +251,18 @@ jobs:
             TASK=":composeApp:linkReleaseFrameworkIosArm64"
           fi
 
+          # Attempt with retry (K/N linker OOM is sometimes transient)
           ./gradlew $TASK \
             --no-daemon --max-workers 1 --no-configuration-cache \
-            -Pkotlin.native.compilation.workers=1
+            -Pkotlin.native.compilation.workers=1 \
+          || {
+            echo "::warning::Link failed, retrying after memory cleanup..."
+            pkill -9 -f "java" || true
+            sleep 20
+            ./gradlew $TASK \
+              --no-daemon --max-workers 1 --no-configuration-cache \
+              -Pkotlin.native.compilation.workers=1
+          }
 
       - name: Prepare framework for Xcode (dry_run)
         if: inputs.dry_run == true
